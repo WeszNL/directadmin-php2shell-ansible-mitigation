@@ -1,0 +1,323 @@
+---
+# Temporary PHP 2026 security mitigation for DirectAdmin / CustomBuild.
+# Modes: -e mitigation_action=apply|verify|rollback
+# Requires Ansible on the controller and root privileges on managed hosts.
+# Existing php.ini files, DirectAdmin templates, and user customizations are preserved.
+- name: Temporary PHP 2026 security mitigation for DirectAdmin
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    mitigation_action: verify
+    mitigation_ini_filename: 99-temporary-php-security-2026-10.ini
+    mitigation_ini_content: |
+      ; ANSIBLE MANAGED: TEMPORARY PHP SECURITY MITIGATION OCTOBER 2026
+      ; Review/remove after PHP security updates; do not edit this managed file.
+      session.upload_progress.enabled = Off
+      session.use_strict_mode = 1
+    mitigation_fpm_template: /usr/local/directadmin/data/templates/custom/php-fpm.conf.custom2
+    mitigation_fpm_marker: '; {mark} ANSIBLE MANAGED PHP 2026 TEMPORARY MITIGATION'
+    mitigation_fpm_block: |
+      php_admin_flag[session.upload_progress.enabled] = off
+      php_admin_flag[session.use_strict_mode] = on
+
+  tasks:
+    - name: Validate requested mode
+      ansible.builtin.assert:
+        that:
+          - mitigation_action in ['apply', 'verify', 'rollback']
+        fail_msg: "Use -e mitigation_action=apply, verify or rollback"
+
+    - name: Verify DirectAdmin CustomBuild is present
+      ansible.builtin.stat:
+        path: /usr/local/directadmin/custombuild/build
+      register: directadmin_build
+
+    - name: Require DirectAdmin CustomBuild
+      ansible.builtin.assert:
+        that:
+          - directadmin_build.stat.exists
+          - directadmin_build.stat.executable | default(false)
+
+    - name: Discover installed PHP version directories
+      ansible.builtin.find:
+        paths: /usr/local
+        patterns: '^php[0-9]{2}$'
+        use_regex: true
+        file_type: directory
+        recurse: false
+      register: php_roots
+
+    - name: Inspect PHP CLI binaries
+      ansible.builtin.stat:
+        path: '{{ item.path }}/bin/php'
+      loop: '{{ php_roots.files }}'
+      loop_control:
+        label: '{{ item.path }}'
+      register: php_binary_stats
+
+    - name: Build list of installed PHP versions
+      ansible.builtin.set_fact:
+        mitigation_php_dirs: >-
+          {{ php_binary_stats.results
+             | selectattr('stat.executable', 'defined')
+             | selectattr('stat.executable')
+             | map(attribute='item.path') | list | sort }}
+
+    - name: Require at least one PHP installation
+      ansible.builtin.assert:
+        that:
+          - mitigation_php_dirs | length > 0
+
+    - name: Check per-version PHP scan directories
+      ansible.builtin.stat:
+        path: '{{ item }}/lib/php.conf.d'
+      loop: '{{ mitigation_php_dirs }}'
+      register: php_scan_dirs
+
+    - name: Ensure scan directories exist (do not create unscanned folders)
+      ansible.builtin.assert:
+        that:
+          - item.stat.isdir | default(false)
+        fail_msg: 'Missing PHP scan directory for {{ item.item }}; investigate before applying.'
+      loop: '{{ php_scan_dirs.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: Read existing temporary INI file metadata
+      ansible.builtin.stat:
+        path: '{{ item }}/lib/php.conf.d/{{ mitigation_ini_filename }}'
+      loop: '{{ mitigation_php_dirs }}'
+      register: mitigation_ini_stats
+
+    - name: Verify dedicated INI files exist on every PHP installation
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: 'Missing temporary mitigation INI for {{ item.item }}'
+      loop: '{{ mitigation_ini_stats.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+      when: mitigation_action == 'verify'
+
+    - name: Read existing temporary INI files
+      ansible.builtin.slurp:
+        src: '{{ item.item }}/lib/php.conf.d/{{ mitigation_ini_filename }}'
+      loop: '{{ mitigation_ini_stats.results }}'
+      when: item.stat.exists
+      register: existing_mitigation_ini
+      no_log: true
+
+    - name: Refuse to replace or delete an unexpected existing INI file
+      ansible.builtin.assert:
+        that:
+          - (item.content | b64decode) == mitigation_ini_content
+        fail_msg: 'Managed INI has unexpected content; refusing to overwrite/delete it.'
+      loop: '{{ existing_mitigation_ini.results }}'
+      when: not (item.skipped | default(false))
+      loop_control:
+        label: '{{ item.source | default("existing temporary INI") }}'
+
+    - name: Install temporary per-version INI (no php.ini changes)
+      ansible.builtin.copy:
+        dest: '{{ item }}/lib/php.conf.d/{{ mitigation_ini_filename }}'
+        content: '{{ mitigation_ini_content }}'
+        owner: root
+        group: root
+        mode: '0644'
+      loop: '{{ mitigation_php_dirs }}'
+      when: mitigation_action == 'apply'
+      register: mitigation_ini_install
+
+    - name: Remove only the dedicated temporary INI files
+      ansible.builtin.file:
+        path: '{{ item }}/lib/php.conf.d/{{ mitigation_ini_filename }}'
+        state: absent
+      loop: '{{ mitigation_php_dirs }}'
+      when: mitigation_action == 'rollback'
+      register: mitigation_ini_remove
+
+    - name: Ensure global DirectAdmin custom-template directory exists
+      ansible.builtin.file:
+        path: '{{ mitigation_fpm_template | dirname }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: mitigation_action == 'apply'
+
+    - name: Inspect global CUSTOM2 template
+      ansible.builtin.stat:
+        path: '{{ mitigation_fpm_template }}'
+      register: mitigation_template_stat
+
+    - name: Manage only our marked PHP-FPM block
+      ansible.builtin.blockinfile:
+        path: '{{ mitigation_fpm_template }}'
+        marker: '{{ mitigation_fpm_marker }}'
+        block: '{{ mitigation_fpm_block }}'
+        state: "{{ 'present' if mitigation_action == 'apply' else 'absent' }}"
+        create: "{{ mitigation_action == 'apply' }}"
+        backup: true
+      when: >-
+        mitigation_action == 'apply' or
+        (mitigation_action == 'rollback' and mitigation_template_stat.stat.exists)
+      register: mitigation_fpm_change
+
+    - name: Regenerate DirectAdmin configurations only after FPM template changes
+      ansible.builtin.command:
+        argv:
+          - /usr/local/directadmin/custombuild/build
+          - rewrite_confs
+      when:
+        - mitigation_action != 'verify'
+        - mitigation_fpm_change.changed | default(false)
+      changed_when: true
+
+    - name: Detect running PHP-FPM services
+      ansible.builtin.service_facts:
+
+    - name: Select installed PHP versions with running PHP-FPM services
+      ansible.builtin.set_fact:
+        mitigation_active_fpm_dirs: >-
+          {{ (mitigation_active_fpm_dirs | default([])) + [item] }}
+      loop: '{{ mitigation_php_dirs }}'
+      when: >-
+        (ansible_facts.services.get('php-fpm' ~ (item | basename | regex_replace('^php', '')) ~ '.service', {}).get('state', '')) == 'running'
+
+    - name: Test configuration syntax for each running PHP-FPM version
+      ansible.builtin.command:
+        argv:
+          - '{{ item }}/sbin/php-fpm{{ item | basename | regex_replace("^php", "") }}'
+          - -t
+      loop: '{{ mitigation_active_fpm_dirs | default([]) }}'
+      changed_when: false
+      register: mitigation_fpm_syntax
+
+    - name: Verify effective settings in PHP CLI for every installed version
+      ansible.builtin.command:
+        argv:
+          - '{{ item }}/bin/php'
+          - -r
+          - "echo (int) ini_get('session.upload_progress.enabled'), ':', (int) ini_get('session.use_strict_mode'), PHP_EOL;"
+      loop: '{{ mitigation_php_dirs }}'
+      changed_when: false
+      register: mitigation_php_ini_values
+      when:
+        - mitigation_action != 'rollback'
+        - not ansible_check_mode or mitigation_action == 'verify'
+      failed_when: >-
+        mitigation_php_ini_values.rc != 0 or
+        (mitigation_php_ini_values.stdout | trim) != '0:1'
+
+    - name: Verify generated FPM pools enforce both settings
+      ansible.builtin.shell: |
+        set -euo pipefail
+        shopt -s nullglob
+        pools=(/usr/local/directadmin/data/users/*/php/php-fpm${PHP_VERSION}.conf)
+        pool_count=0
+        for pool in "${pools[@]}"; do
+          ((pool_count += 1))
+        done
+        if ((pool_count == 0)); then
+          echo "No generated pools for active PHP-FPM ${PHP_VERSION}" >&2
+          exit 1
+        fi
+        for pool in "${pools[@]}"; do
+          upload=$(grep -Ei '^[[:space:]]*php_admin_(flag|value)\[session\.upload_progress\.enabled\][[:space:]]*=' "$pool" | tail -n 1 || true)
+          strict=$(grep -Ei '^[[:space:]]*php_admin_(flag|value)\[session\.use_strict_mode\][[:space:]]*=' "$pool" | tail -n 1 || true)
+          if ! [[ "$upload" =~ ^[[:space:]]*php_admin_flag\[session\.upload_progress\.enabled\][[:space:]]*=[[:space:]]*(off|0)[[:space:]]*$ ]]; then
+            echo "FAILED upload_progress: ${pool}: ${upload}" >&2
+            exit 1
+          fi
+          if ! [[ "$strict" =~ ^[[:space:]]*php_admin_flag\[session\.use_strict_mode\][[:space:]]*=[[:space:]]*(on|1)[[:space:]]*$ ]]; then
+            echo "FAILED strict_mode: ${pool}: ${strict}" >&2
+            exit 1
+          fi
+        done
+        echo "PASS PHP-FPM ${PHP_VERSION}: ${pool_count} pool(s)"
+      args:
+        executable: /bin/bash
+      environment:
+        PHP_VERSION: '{{ item | basename | regex_replace("^php", "") }}'
+      loop: '{{ mitigation_active_fpm_dirs | default([]) }}'
+      changed_when: false
+      when:
+        - mitigation_action in ['apply', 'verify']
+        - not ansible_check_mode or mitigation_action == 'verify'
+      register: mitigation_pool_checks
+
+    - name: Reload running PHP-FPM services if temporary configuration changed
+      ansible.builtin.command:
+        argv:
+          - /bin/systemctl
+          - reload-or-restart
+          - 'php-fpm{{ item | basename | regex_replace("^php", "") }}.service'
+      changed_when: true
+      loop: '{{ mitigation_active_fpm_dirs | default([]) }}'
+      when:
+        - mitigation_action != 'verify'
+        - >-
+          (mitigation_fpm_change.changed | default(false)) or
+          ((mitigation_ini_install.results | default([]) | selectattr('changed', 'defined') | selectattr('changed') | list | length) > 0) or
+          ((mitigation_ini_remove.results | default([]) | selectattr('changed', 'defined') | selectattr('changed') | list | length) > 0)
+
+    - name: Verify rollback removed only our marker from the global template
+      ansible.builtin.command:
+        argv:
+          - /bin/grep
+          - -F
+          - 'ANSIBLE MANAGED PHP 2026 TEMPORARY MITIGATION'
+          - '{{ mitigation_fpm_template }}'
+      register: mitigation_marker_check
+      changed_when: false
+      failed_when: mitigation_marker_check.rc != 1
+      when:
+        - mitigation_action == 'rollback'
+        - mitigation_template_stat.stat.exists
+
+    - name: Verify temporary INI files are absent after rollback
+      ansible.builtin.stat:
+        path: '{{ item }}/lib/php.conf.d/{{ mitigation_ini_filename }}'
+      loop: '{{ mitigation_php_dirs }}'
+      register: rollback_ini_stats
+      when: mitigation_action == 'rollback'
+
+    - name: Fail if a temporary INI file remains after rollback
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists
+      loop: '{{ rollback_ini_stats.results | default([]) }}'
+      when:
+        - mitigation_action == 'rollback'
+        - not (item.skipped | default(false))
+
+    - name: Report validated PHP INI values
+      ansible.builtin.debug:
+        msg: '{{ item.item | basename }}: upload_progress:strict_mode = {{ item.stdout | trim }}'
+      loop: '{{ mitigation_php_ini_values.results | default([]) }}'
+      when:
+        - mitigation_action in ['apply', 'verify']
+        - not (item.skipped | default(false))
+      loop_control:
+        label: '{{ item.item | default("PHP version") | basename }}'
+
+    - name: Report validated PHP-FPM pools
+      ansible.builtin.debug:
+        msg: '{{ item.stdout | trim }}'
+      loop: '{{ mitigation_pool_checks.results | default([]) }}'
+      when:
+        - mitigation_action in ['apply', 'verify']
+        - not (item.skipped | default(false))
+      loop_control:
+        label: '{{ item.item | default("PHP-FPM version") | basename }}'
+
+    - name: Report temporary mitigation state
+      ansible.builtin.debug:
+        msg:
+          - 'Action: {{ mitigation_action }}'
+          - 'PHP installations: {{ mitigation_php_dirs | map("basename") | list | join(", ") }}'
+          - 'Running PHP-FPM versions: {{ mitigation_active_fpm_dirs | default([]) | map("basename") | list | join(", ") }}'
+          - 'Dedicated INI: {{ mitigation_ini_filename }}'
+          - 'Other templates and customer customizations were not replaced.'
